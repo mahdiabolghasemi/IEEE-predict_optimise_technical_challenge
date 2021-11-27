@@ -1,14 +1,16 @@
 ---
 title: "Solar-Demand_Energy_Forecasting"
 author: "Mahdi Abolghasemi"
-date: "23/10/2021"
+date: "30/10/2021"
 output: html_document
 ---
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, fig.width=8, fig.height=6)
+options(scipen = 999)
+theme_set(theme_bw())
 
-# Load packages
+# Load required packages
 library(tidyverse)
 library(scales)
 library(lubridate)
@@ -38,7 +40,6 @@ library(lemon)
 library(formattable)
 library(Hmisc)
 library(corrplot)
-#library(ggcorrplot)
 library(lattice)
 library(knitr)
 library(kableExtra)
@@ -50,19 +51,10 @@ library(here)
 library(lightgbm)
 library(oce)
 library(openair)
-
-# deactivate scientific notation
-options(scipen = 999)
-
-# Set plot theme
-theme_set(theme_bw())
 ```
 
-# Reading data
-
-
-# Preprocessing data and creating some calendar features
-I save the calendar features in data frames and save it in the following objects, so we can use it from here on.
+# Reading solar and building data
+We created calendar features and save it in the following objects, so we can use it from here on.
 ```{r, echo=FALSE}
 #saveRDS(tsibble_data_Oct, "tsibble_data_Oct.rds")
 tsibble_data_Oct <- read_rds(here::here("Data","tsibble_data_Oct.rds"))
@@ -71,442 +63,100 @@ tsibble_data_Oct <- read_rds(here::here("Data","tsibble_data_Oct.rds"))
 tsibble_data_All <- read_rds(here::here("Data", "tsibble_data_All_UTC.rds"))
 ```
 
-There is an outlier in October data, we replace it with na. 
 ```{r}
-tsibble_data_Oct <- tsibble_data_Oct %>% replace_with_na(list(series_value=1744.1))
-```
-
-# Check for outliers, negative, missing values
-
-We can see that there are lots of missing values across both solars and buildings data. We remove them from our series. 
-
-
-```{r}
-#defining solars and buildings 
+#defining solars and buildingsseries
 solars <- c("Solar0", "Solar1", "Solar2", "Solar3", "Solar4", "Solar5")
 buildings <- c("Building0", "Building1", "Building3", "Building4", "Building5", "Building6")
 ```
 
-```{r fig.height=9, fig.width=16, eval=FALSE}
-# Vector of each month in the  data
-Months <- tsibble_data_All %>% distinct(Month) %>% pull()
-```
-
-Descriptive statistics of data is shown below.
-```{r desc_stat-table, echo=FALSE, eval=TRUE}
-tsibble_data_All %>% na.omit() %>% 
-  select(series_name, Date, Year, Month, Day_of_Month, Day, Week, Hour, Minute, series_value) %>%
-  group_by(series_name) %>%
-  summarise(mean_series_value_avg = round(mean(series_value, na.rm=TRUE), 2),
-            sd_series_value_avg = round(sd(series_value), 2),
-            iqr_series_value_avg = IQR(series_value),
-            min_series_value_avg = min(series_value),
-            max_series_value_avg = max(series_value)) %>%
-  ungroup() %>%
-  kable("html", booktabs = T, col.names = c("Groups", "Mean", "Std. Dev.", "IQR", "Min", "Max"), caption = "Summary statistics of Avg. Power and Demand in Different Groups.") %>%
-  kable_styling(latex_options = c("hold_position"), position = "center") %>%
-  column_spec(1, bold=F) %>%
-  kableExtra::collapse_rows(columns = 1, latex_hline = "major", valign = "middle")
-```
-
-There are many periods that solar power is not generated. Most of them obviously are during evenings/nights/early mornings but also sometimes before noon which may be impacted by weather conditions, e.g, cloud coverage.  
-
-```{r fig_period_no_solarpower, echo=FALSE}
-#periods without solar power during the hours of day
-tsibble_data_All %>%
-  filter(series_name %in% solars) %>%
-  filter(series_value == 0) %>%
-  group_by(Hour) %>%
-  mutate(fifteen_minute_instances = n()) %>%
-  ungroup() %>%
-  #mutate(Duration = (fifteen_minute_instances/4)/24) %>%
-  ggplot(aes(x = Hour, y = fifteen_minute_instances)) +
-  geom_bar(stat = "identity") +
-  facet_wrap(~Month) +
-  labs(subtitle = "Number of Periods without solar power",
-           y = "Total Number of periods without solar power (15mins periods)",
-           x = "Hour of the day") +
-  theme_bw() +
-  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
-  scale_x_continuous(breaks= scales::pretty_breaks(n = 24), expand = c(0,0))
-```
-
-We further look in to each panel to see which ones generate zero power more often. It seems like they all have similar distribution except solar 0 which is just lower. We may be able to build a unique model for all of them. 
-```{r fig_period_no_solarpower, echo=FALSE}
-#periods without solar power during the hours of day
-tsibble_data_All %>%
-  filter(series_name %in% solars) %>%
-  filter(series_value == 0) %>%
-  group_by(Hour) %>%
-  mutate(fifteen_minute_instances = n()) %>%
-  ungroup() %>%
-  mutate(Duration = (fifteen_minute_instances/4)/24) %>%
-  ggplot(aes(x = Hour, y = fifteen_minute_instances)) +
-  geom_bar(stat = "identity") +
-  facet_wrap(~series_name) +
-  labs(subtitle = "Number of Periods without solar power",
-           y = "Total periods without solar power (number of 15 mins)",
-           x = "Hour of the day") +
-  theme_bw() +
-  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
-  scale_x_continuous(breaks= scales::pretty_breaks(n = 24), expand = c(0,0))
-```
-
-Solar power has a nice normal distribution as shown below. More powers in midday and less over other periods. 
-
-```{r fig_period_avg_solarpower, echo=FALSE}
-tsibble_data_All %>%
-  filter(series_name %in% solars) %>%
-  filter(series_value >= 0) %>%
-  group_by(Hour) %>%
-  mutate(mean_power = mean(series_value, na.rm = TRUE))%>%
-  ungroup() %>%
-  #mutate(Duration = (fifteen_minute_instances/4)/24) %>%
-  ggplot(aes(x = Hour, y = mean_power)) +
-  geom_bar(stat = "identity") +
-  facet_wrap(~series_name) +
-  labs(subtitle = "Avg Solar Power over the day for each solar panel",
-           y = "Avg solar power (Kw)",
-           x = "Hour of the day") +
-  theme_bw() +
-  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
-  scale_x_continuous(breaks= scales::pretty_breaks(n = 24), expand = c(0,0))
-```
-
-## Exploratory data analysis for buildings
-
-There is no period with negative or zero demand for buildings. Only positive ones as shown below. The largest demand is between 7 AM- 10 pm. 
-It is interesting that except building 5 , the rest of require a significant amount of energy which may be indicative of bigger building, or more scheduled classes during those times. 
-
-```{r period_no_demand, echo=FALSE}
-# Plot of total hours without power production in each month
-tsibble_data_All %>%
-  filter(series_name %in% buildings) %>%
-  filter(series_value == 0)
-```
-The grpah below shows the average power required in buildings over the years.
-```{r fig_period_avg_demand_hour, echo=FALSE}
-tsibble_data_All %>%
-  filter(series_name %in% buildings) %>%
-  filter(series_value >= 0) %>%
-  group_by(Hour, Year) %>%
-  mutate(mean_power = mean(series_value)) %>%
-  ungroup() %>%
-  #mutate(Duration = (fifteen_minute_instances/4)/24) %>%
-  ggplot(aes(x = Hour, y = mean_power/1000)) +
-  geom_bar(stat = "identity") +
-  facet_wrap(Year~series_name) +
-  labs(subtitle = "Avg Demand over Periods",
-           y = "Demand",
-           x = "Hour of the day") +
-  theme_bw() +
-  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
-  scale_x_continuous(breaks= scales::pretty_breaks(n = 24), expand = c(0,0))
-```
-
-
-We looked into the power over each month and day of the week. There is less power required over the weekends, i.e, days 6 and 7. We can see that there is more power required during March which may attribute to the start of semester at Monash University. 
-```{r fig_period_avg_demand_day,  fig.height=10, echo=FALSE}
-tsibble_data_All %>%
-  filter(series_name %in% buildings) %>%
-  filter(series_value >= 0) %>%
-  group_by(Day, Month, Year) %>%
-  mutate(mean_power = mean(series_value)) %>%
-  ungroup() %>%
-  #mutate(Duration = (fifteen_minute_instances/4)/24) %>%
-  ggplot(aes(x = (Day), y = mean_power)) +
-  geom_bar(stat = "identity") +
-  facet_wrap(Year ~ Month) +
-  labs(subtitle = "Avg Demand over Days",
-           y = "Demand",
-           x = "Day of the Month") +
-  theme_bw() +
-  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +
-  scale_x_continuous(breaks= scales::pretty_breaks(n = 7), expand = c(0,0))
-```
-
-
-
-# Wrangling weather data
-
-We downloaded solar, rain fall, max and min temperature from BOM. These data sets are recorded for each day which may not be ideal for our forecasting as we generate forecast for each 15 minute time slot. There is minutely data available that can be purchased but we continue with the daily data. 
+We run preprocessing on building and solar data to clean up the missing values, choose the relevant observations, and save the final data.  We check for outliers, negative, missing values. We can see that there are lots of missing values across both solars and buildings data. After an extensive analysis and running several experiments, we removed missing values from our series. `building_clean_all` is the subset of building data, and `solar_clean_all` is the subset of solar data. The final data are saved and can be read below. 
 
 ```{r}
-# this is the recorded data as done above.
-#saveRDS(Weather_data, "Weather_data.rds")
-Weather_data <- read_rds(here::here("Data", "Weather_data.rds"))
-```
-
-
-```{r fig_avr_exposure, message=FALSE , echo=FALSE, fig.width=10, fig.height=7.5, fig.pos="H"}
-# Time plot of avg temperature grouped by Time
-Weather_data %>%
-  group_by(Day, Month) %>%
-  summarise(mean_Expo_avg = mean(Avg_Exposure)) %>%
-  ungroup() %>%
-  ggplot(aes(x = as.factor(Day), y = mean_Expo_avg)) +
-  geom_bar(stat = "identity") +
-  facet_wrap( ~ Month) +
-  #scale_color_manual(values=group.colours, breaks = c("Summer", "Autumn", "Winter", "Spring")) +
-  scale_colour_brewer(palette = "Set1") +
-  labs(title =  "Mean of Exposure during the year",
-       y = "Me an of Exposure (Megajuoules/Square meter)",
-       x = "Day") +
-  theme_bw() +
-  theme(axis.text.x = element_text(size = 5, angle = 45, hjust = 1)) +
-  #theme(legend.position="bottom") +
-  guides(colour = guide_legend(override.aes = list(size = 1.5, alpha = 1)))
-```
-
-```{r fig_avr_rain, message=FALSE , echo=FALSE, fig.width=10, fig.height=7.5, fig.pos="H"}
-# Time plot of avg rainfall grouped by Time
-Weather_data %>%
-  group_by(Day, Month) %>%
-  summarise(mean_RainFall_avg = mean(Avg_RainFall)) %>%
-  ungroup() %>%
-  ggplot(aes(x = as.factor(Day), y = mean_RainFall_avg)) +
-  geom_bar(stat = "identity") +
-  facet_wrap( ~ Month) +
-  scale_colour_brewer(palette = "Set1") +
-  labs(title =  "Mean of RainFall during the year",
-       y = "Mean of RainFall",
-       x = "Day") +
-  theme_bw() +
-  theme(axis.text.x = element_text(size = 5, angle = 45, hjust = 1)) +
-  guides(colour = guide_legend(override.aes = list(size = 1.5, alpha = 1)))
-```
-
-
-```{r fig_avr_maxtemp, message=FALSE , echo=FALSE, fig.width=10, fig.height=7.5, fig.pos="H"}
-# Time plot of avg max temp grouped by Time
-Weather_data %>%
-  group_by(Day, Month) %>%
-  summarise(mean_MaxTemp_avg = mean(Avg_MaxTemp)) %>%
-  ungroup() %>%
-  ggplot(aes(x = as.factor(Day), y = mean_MaxTemp_avg)) +
-  geom_bar(stat = "identity") +
-  facet_wrap( ~ Month) +
-  scale_colour_brewer(palette = "Set1") +
-  labs(title =  "Mean of Max Temp during the year",
-       y = "Mean of Max Temp",
-       x = "Day") +
-  theme_bw() +
-  theme(axis.text.x = element_text(size = 5, angle = 45, hjust = 1)) +
-  guides(colour = guide_legend(override.aes = list(size = 1.5, alpha = 1)))
-```
-
-
-Creating solar and building data
-```{r, echo=FALSE}
-tsibble_data_solar <- tsibble_data_All %>%
-  filter(series_name %in% solars)
-```
-
-```{r , echo=FALSE}
-tsibble_data_building <- tsibble_data_All %>%
-  filter(series_name %in% buildings)
-```
-
-We run preprocessing on building and solar data to clean up the missing values, choose the relavant observations, and save the final. The final data are saved below. 
-
-```{r}
-# saveRDS(tsibble_data_clean, "tsibble_data_clean.rds")
 # saveRDS(solar_clean_all, "solar_clean_all.rds")
 # saveRDS(building_clean_all, "building_clean_all.rds")
-tsibble_data_clean <- read_rds(here::here("Data","tsibble_data_clean.rds"))
 solar_clean_all <- read_rds(here::here("Data", "solar_clean_all.rds"))
 building_clean_all <- read_rds(here::here("Data","building_clean_all.rds"))
 building_clean_all <- building_clean_all %>% replace_with_na(list(series_value=1744.1))
 ```
 
 
-## Feature Engineering daily weather data: BOM data
+# Reading weather data
 
-We create some rolling features for weather data. This will be used later in the forecasting model. 
+We downloaded solar, rain fall, max and min temperature from BOM. These data sets are recorded for each day which may not be ideal for our forecasting as we generate forecast for each 15 minute time slot. We do feature engineering on data. The final data is saved and can be loaded using the script below.
+
 ```{r}
-Daily_WeatherData_Feats <- Weather_data %>%
-  mutate(max_Temp_rollingMean_2_day = zoo::rollapply(Avg_MaxTemp, width = 2, FUN = mean, align = "right", fill = NA),
-         max_Temp_rollingSd_3_day = zoo::rollapply(Avg_MaxTemp, width = 3, FUN = sd, align = "right", fill = NA),
-         
-         min_Temp_rollingMean_2_day = zoo::rollapply(Avg_MinTemp, width = 2, FUN = mean, align = "right", fill = NA),
-         min_Temp_rollingSd_3_day = zoo::rollapply(Avg_MinTemp, width = 3, FUN = sd, align = "right", fill = NA),
-         
-         SolarExpo_rollingMean_2_day = zoo::rollapply(Avg_Exposure, width = 2, FUN = mean, align = "right", fill = NA),
-         SolarExpo_rollingSd_3_day = zoo::rollapply(Avg_Exposure, width = 3, FUN = sd, align = "right", fill = NA),
-         
-         RainFall_rollingMean_2_day = zoo::rollapply(Avg_RainFall, width = 2, FUN = mean, align = "right", fill = NA),
-         RainFall_rollingSd_3_day = zoo:: rollapply(Avg_RainFall, width = 3, FUN = sd, align = "right", fill = NA))
-
-lags <- 1:3
-lag_names <- paste("lag", formatC(lags, width = nchar(max(lags)), flag = "0"), 
-  sep = "_")
-lag_functions <- setNames(paste("dplyr::lag(., ", lags, ")"), lag_names)
-
-# Create lags of series values
-Daily_WeatherData_Feats <- Daily_WeatherData_Feats %>%
-  mutate_at(vars(Avg_MaxTemp ,Avg_MinTemp, Avg_RainFall, Avg_Exposure), funs_(lag_functions)) %>%
-  rename_at(vars(starts_with("lag")), ~ paste0("lag_",.x))
+#saveRDS(Weather_data, "Weather_data.rds")
+Weather_data <- read_rds(here::here("Data", "Weather_data.rds"))
 ```
 
+## Feature Engineering daily and houlry weather data
+
+We conduct extensive feature engineering and create various rolling features for weather data. The final daily weather data is stored and can be read below.
 ```{r}
 #saveRDS(Daily_WeatherData_Feats, "Daily_WeatherData_Feats.rds")
 Daily_WeatherData_Feats <- read_rds(here::here("Data","Daily_WeatherData_Feats.rds"))
 ```
 
-## Feature engineering hourly weather data: ERA data
-
-```{r}
-ERA_Feats <- ERA %>% 
-  mutate(Hour= hour(TimeDate), Date= date(TimeDate)) %>%
-  mutate(Temperature_rollingMean_3_hours = zoo::rollapply(Temperature, width = 3, FUN = mean, align = "right", fill = NA),
-         Temperature_rollingMean_6_hours = zoo::rollapply(Temperature, width = 6, FUN = mean, align = "right", fill = NA),
-         Temperature_rollingSd_6_hours = zoo::rollapply(Temperature, width = 6, FUN = sd, align = "right", fill = NA),
-         
-         TemperatureDew_rollingMean_3_hours = zoo::rollapply(TemperatureDew, width = 3, FUN = mean, align = "right", fill = NA),
-         TemperatureDew_rollingMean_6_hours = zoo::rollapply(TemperatureDew, width = 6, FUN = mean, align = "right", fill = NA),
-         TemperatureDew_rollingSd_6_hours = zoo::rollapply(TemperatureDew, width = 6, FUN = sd, align = "right", fill = NA),
-         
-         WindSpeed_rollingMean_3_hours = zoo::rollapply(WindSpeed, width = 3, FUN = mean, align = "right", fill = NA),
-         WindSpeed_rollingMean_6_hours = zoo::rollapply(WindSpeed, width = 6, FUN = mean, align = "right", fill = NA),
-         WindSpeed_rollingSd_6_hours = zoo::rollapply(WindSpeed, width = 6, FUN = sd, align = "right", fill = NA),
-                  
-         Pressure_rollingMean_3_hours = zoo::rollapply(Pressure, width = 3, FUN = mean, align = "right", fill = NA),
-         Pressure_rollingMean_6_hours = zoo::rollapply(Pressure, width = 6, FUN = mean, align = "right", fill = NA),
-         Pressure_rollingSd_6_hours = zoo::rollapply(Pressure, width = 6, FUN = sd, align = "right", fill = NA),
-         
-         Humidity_rollingMean_3_hours = zoo::rollapply(Humidity, width = 3, FUN = mean, align = "right", fill = NA),
-         Humidity_rollingMean_6_hours = zoo::rollapply(Humidity, width = 6, FUN = mean, align = "right", fill = NA),
-         Humidity_rollingSd_6_hours = zoo::rollapply(Humidity, width = 6, FUN = sd, align = "right", fill = NA),
-         
-         Solar_radiation_rollingMean_3_hours = zoo::rollapply(Surface_solar_radiation, width=3, FUN = mean,align="right", fill = NA),
-         Solar_radiation_rollingMean_6_hours = zoo::rollapply(Surface_solar_radiation, width = 6, FUN=mean,align="right", fill = NA),
-         Solar_radiation_rollingSd_6_hours = zoo::rollapply(Surface_solar_radiation, width = 6,FUN=sd,align="right",fill = NA),
-         
-         Thermal_radiation_rollingMean_3_hours=zoo::rollapply(Surface_Thermal_radiation,width=3,FUN=mean,align = "right", fill = NA),
-         Thermal_radiation_rollingMean_6_hours=zoo::rollapply(Surface_Thermal_radiation,width=6,FUN=mean,align = "right", fill = NA),
-         Thermal_radiation_rollingSd_6_hours=zoo::rollapply(Surface_Thermal_radiation,width=6,FUN=sd,align = "right", fill = NA),
-         
-         Cloud_Cove_rollingMean_3_hours = zoo::rollapply(Cloud_Cove, width = 3, FUN = mean, align = "right", fill = NA),
-         Cloud_Cove_rollingMean_6_hours = zoo::rollapply(Cloud_Cove, width = 6, FUN = mean, align = "right", fill = NA),
-         Cloud_Cove_rollingSd_6_hours = zoo::rollapply(Cloud_Cove, width = 6, FUN = sd, align = "right", fill = NA))
-
-lags <- 1:3
-lag_names <- paste("lag", formatC(lags, width = nchar(max(lags)), flag = "0"), 
-  sep = "_")
-lag_functions <- setNames(paste("dplyr::lag(., ", lags, ")"), lag_names)
-
-# Create lags of series values
-ERA_Feats <- ERA_Feats %>%
-  mutate_at(vars(Temperature,TemperatureDew,Surface_solar_radiation,Humidity,Pressure,Surface_Thermal_radiation, Cloud_Cove), funs_(lag_functions)) %>%
-  rename_at(vars(starts_with("lag")), ~ paste0("lag_",.x))
-```
-
-
+The final hourly data is stored below. 
 ```{r}
 #saveRDS(ERA_Feats,here("Data", "ERA_Feats.RDS"))
 ERA_Feats <- read_rds(here::here("Data", "ERA_Feats.rds"))
 ```
 
-## Creating required data for buildings and solar: daily data
-```{r train-data_building, eval=TRUE}
- building_clean_weather_daily <- building_clean_all %>% 
-  left_join(Daily_WeatherData_Feats %>% select(-Day, -Year, -Month, -(contains("lag"))), by= c("Date"="index"))
 
-building_clean_weather_train_daily <- building_clean_weather_daily %>%
-    filter(Date < "2020-11-01") %>%
-    select(-TimeDate, series_name, Year, Season, Month, Week, Day_of_Month,Day, Hour, Minute,everything()) %>%
-   select(-start_timestamp,-Avg_Exposure, -SolarExpo_rollingMean_2_day, -SolarExpo_rollingSd_3_day)
+# Joining data and creating required data for buildings and solars series using daily and hourly data
 
-building_clean_weather_test_daily <- building_clean_weather_daily %>%
-  filter((Date) >= "2020-09-01" & Date < "2020-11-01") %>% 
-  distinct(TimeDate,series_name, .keep_all = TRUE) %>%
-select(-TimeDate, series_name, Year, Season, Month, Week, Day_of_Month,Day, Hour, Minute,everything()) %>%
-   select(-start_timestamp,-Avg_Exposure, -SolarExpo_rollingMean_2_day, -SolarExpo_rollingSd_3_day)
+We don't need to read the next two chunks, but in case needed this chunk merges the required data that is saved and loaded above.
+
+```{r train-data_building, eval=FALSR}
+# building_clean_weather_daily <- building_clean_all %>% 
+ # left_join(Daily_WeatherData_Feats %>% select(-Day, -Year, -Month, -(contains("lag"))), by= c("Date"="index"))
+
+#building_clean_weather_train_daily <- building_clean_weather_daily %>%
+ #   filter(Date < "2020-11-01") %>%
+  #  select(-TimeDate, series_name, Year, Season, Month, Week, Day_of_Month,Day, Hour, Minute,everything()) %>%
+  # select(-start_timestamp,-Avg_Exposure, -SolarExpo_rollingMean_2_day, -SolarExpo_rollingSd_3_day)
+
+#building_clean_weather_test_daily <- building_clean_weather_daily %>%
+  #filter((Date) >= "2020-09-01" & Date < "2020-11-01") %>% 
+ # distinct(TimeDate,series_name, .keep_all = TRUE) %>%
+#select(-TimeDate, series_name, Year, Season, Month, Week, Day_of_Month,Day, Hour, Minute,everything()) %>% select(-start_timestamp,-Avg_Exposure, -SolarExpo_rollingMean_2_day, -SolarExpo_rollingSd_3_day)
 ```
 
+```{r train-data_solars, eval=FALSE}
+# solar_clean_weather_daily <- solar_clean_all %>% 
+ # left_join(Daily_WeatherData_Feats %>% select(-Day, -Year, -Month, -(contains("lag"))), by= c("Date"="index"))
 
-```{r train-data_solars, eval=TRUE}
- solar_clean_weather_daily <- solar_clean_all %>% 
-  left_join(Daily_WeatherData_Feats %>% select(-Day, -Year, -Month, -(contains("lag"))), by= c("Date"="index"))
+#solar_clean_weather_train_daily <- solar_clean_weather_daily %>%
+  #  filter(Date < "2020-11-01") %>%
+ #   select(-TimeDate, series_name, Year, Season, Month, Week, Day_of_Month,Day, Hour, Minute,everything()) %>%
+ #   select(-start_timestamp,-RainFall_rollingMean_2_day, -RainFall_rollingSd_3_day)
 
-solar_clean_weather_train_daily <- solar_clean_weather_daily %>%
-    filter(Date < "2020-11-01") %>%
-    select(-TimeDate, series_name, Year, Season, Month, Week, Day_of_Month,Day, Hour, Minute,everything()) %>%
-    select(-start_timestamp,-RainFall_rollingMean_2_day, -RainFall_rollingSd_3_day)
-
-solar_clean_weather_test_daily <- solar_clean_weather_daily %>%
-  filter(Date >= "2020-09-01" & Date < "2020-11-01") %>%
-  distinct(TimeDate,series_name, .keep_all = TRUE) %>%
-   select(-TimeDate, series_name, Year, Season, Month, Week, Day_of_Month,Day, Hour, Minute,everything()) %>%
-  select(-start_timestamp,-RainFall_rollingMean_2_day, -RainFall_rollingSd_3_day)
+#solar_clean_weather_test_daily <- solar_clean_weather_daily %>%
+#  filter(Date >= "2020-09-01" & Date < "2020-11-01") %>%
+#  distinct(TimeDate,series_name, .keep_all = TRUE) %>%
+#   select(-TimeDate, series_name, Year, Season, Month, Week, Day_of_Month,Day, Hour, Minute,everything()) %>%
+ # select(-start_timestamp,-RainFall_rollingMean_2_day, -RainFall_rollingSd_3_day)
 ```
 
-
+The final data are stored and read below:
 ```{r}
-Daily_WeatherData_Feats_Oct_building <- Daily_WeatherData_Feats %>% 
-   select(-Avg_Exposure, -SolarExpo_rollingMean_2_day, -SolarExpo_rollingSd_3_day) %>%
-  select(-Day, Year, -Month, -(contains("lag"))) %>%
-  filter(index>="2020-10-01" & index <"2020-11-01") %>%
-  dplyr::slice(rep(1:n(), each = 24*4)) %>%  
-  mutate(Hour = rep(rep(c(0:23), each=4), 31),
-         #series_name = as.character(series_name),
-         Minute = rep(c(0,15,30,45), 31*24), #which of the four 15 minutes block in one hour it is
-         Date = date(index),
-         #TimeDate = lubridate::ymd_hms(paste0(index, Hour, Minute)),
-         #Year = year(start_timestamp), 
-         Month =lubridate::month(index, label= TRUE), 
-         Day_of_Month = day(index),
-         Day = weekdays(index),
-         Week = week(index),
-         Season = case_when(
-           Month %in% c("Dec", "Jan", "Feb") ~ 1,
-           Month %in% c("Mar", "Apr", "May") ~ 2,
-           Month %in% c("Jun", "Jul", "Aug") ~ 3,
-           Month %in% c("Sep", "Oct", "Nov")  ~ 4),
-         Day = case_when(
-           Day == "Monday" ~ 1,
-           Day == "Tuesday" ~ 2,
-           Day == "Wednesday" ~ 3,
-           Day == "Thursday" ~ 4,
-           Day == "Friday" ~ 5,
-           Day == "Saturday" ~ 6,
-           Day == "Sunday" ~ 7)
-         ) %>% as_tibble() %>%
-  select(Date, Year, Season, Month, Day_of_Month,Day, Week, Hour, Minute, everything()) %>% select(-index)
+solar_clean_weather_train_hourly <- readRDS(here::here("Data","solar_clean_weather_train_hourly.rds"))
+building_clean_weather_train_hourly <- readRDS(here::here("Data","building_clean_weather_train_hourly.rds"))
+
+solar_clean_weather_train_daily <- readRDS(here::here("Data","solar_clean_weather_train_daily.rds"))
+building_clean_weather_train_daily <- readRDS(here::here("Data","building_clean_weather_train_daily.rds"))
 ```
 
 ```{r}
-Daily_WeatherData_Feats_Oct_solar <- Daily_WeatherData_Feats %>%  
-    select(-RainFall_rollingMean_2_day, -RainFall_rollingSd_3_day) %>%
-   select(-Day, Year, -Month, -(contains("lag"))) %>%
-  filter(index>="2020-10-01" & index <"2020-11-01") %>%
-  dplyr::slice(rep(1:n(), each = 24*4)) %>%  
-  mutate(Hour = rep(rep(c(0:23), each=4), 31),
-         #series_name = as.character(series_name),
-         Minute = rep(c(0,15,30,45), 31*24), #which of the four 15 minutes block in one hour it is
-         Date = date(index),
-         #TimeDate = lubridate::ymd_hms(paste0(index, Hour, Minute)),
-         #Year = year(start_timestamp), 
-         Month =lubridate::month(index, label= TRUE), 
-         Day_of_Month = day(index),
-         Day = weekdays(index),
-         Week = week(index),
-         Season = case_when(
-           Month %in% c("Dec", "Jan", "Feb") ~ 1,
-           Month %in% c("Mar", "Apr", "May") ~ 2,
-           Month %in% c("Jun", "Jul", "Aug") ~ 3,
-           Month %in% c("Sep", "Oct", "Nov")  ~ 4),
-         Day = case_when(
-           Day == "Monday" ~ 1,
-           Day == "Tuesday" ~ 2,
-           Day == "Wednesday" ~ 3,
-           Day == "Thursday" ~ 4,
-           Day == "Friday" ~ 5,
-           Day == "Saturday" ~ 6,
-           Day == "Sunday" ~ 7)
-         ) %>% as_tibble() %>%
-  select(Date, Year, Season, Month, Day_of_Month,Day, Week, Hour, Minute, everything()) %>% select(-index)
+solar_clean_weather_test_hourly <- readRDS(here::here("Data","solar_clean_weather_test_hourly.rds"))
+building_clean_weather_test_hourly <- readRDS(here::here("Data","building_clean_weather_test_hourly.rds"))
+
+solar_clean_weather_test_daily <- readRDS(here::here("Data","solar_clean_weather_test_daily.rds"))
+building_clean_weather_test_daily <- readRDS(here::here("Data","building_clean_weather_test_daily.rds"))
 ```
+
+We need to create rolling features of weather data for November exactly same as the feature engineering done on feature engineered , so that it will be used as inputs of the forecasting models used for building and solar series separately. 
 
 ```{r}
 Daily_WeatherData_Feats_Nov_building <- Daily_WeatherData_Feats %>% 
@@ -543,8 +193,8 @@ Daily_WeatherData_Feats_Nov_building <- Daily_WeatherData_Feats %>%
 
 ```{r}
 Daily_WeatherData_Feats_Nov_solar <- Daily_WeatherData_Feats %>%  
-  ##### NOTe    IMPORTANT### This is only needed for dailyhourly, for daily it must be deactivated
-    #select(-RainFall_rollingMean_2_day, -RainFall_rollingSd_3_day) %>% 
+  ##### NOTE-IMPORTANT### This is only needed for dailyhourly, for daily it must be deactivated
+  select(-RainFall_rollingMean_2_day, -RainFall_rollingSd_3_day) %>% 
    select(-Day, Year, -Month, -(contains("lag"))) %>%
   filter(index>="2020-11-01" & index <"2020-12-01") %>%
   dplyr::slice(rep(1:n(), each = 24*4)) %>%  
@@ -574,6 +224,7 @@ Daily_WeatherData_Feats_Nov_solar <- Daily_WeatherData_Feats %>%
          ) %>% as_tibble() %>%
   select(Date, Year, Season, Month, Day_of_Month,Day, Week, Hour, Minute, everything()) %>% select(-index)
 ```
+
 
 ## Models and Predictions with daily data
 
@@ -665,10 +316,7 @@ lgbm_mod_b5_f1mae_daily <- lightgbm::lightgbm(
   data = as.matrix(building_clean_weather_train_daily  %>% 
                      filter(Date < "2020-11-01") %>% #Date>"2020-01-01" & 
                      filter(series_name=="Building5") %>% as_tibble() %>%
-                     select(-series_value, -series_name, -TimeDate)), #%>%
-   # mutate(End_lock_down= case_when(
-     # Date>="2020-10-19" ~ 1,
-     # Date<"2020-10-19" ~ 0))),
+                     select(-series_value, -series_name, -TimeDate)),
   label = building_clean_weather_train_daily   %>% 
     filter(Date < "2020-11-01") %>% #Date>"2020-01-01" & 
     filter(series_name=="Building5") %>% pull(series_value),
@@ -683,7 +331,6 @@ lgbm_mod_b5_f1mae_daily <- lightgbm::lightgbm(
   boosting = "gbdt", 
   lambda_l1 = 0.1,  
   verbose = -1)
-
 
 
 lgbm_mod_b6_f1mae_daily <- lightgbm::lightgbm(
@@ -840,23 +487,33 @@ lgbm_mod_s5_f1mae_daily  <- lightgbm::lightgbm(
   verbose = -1)
 ```
 
-
+Predictions for November using dailt data are generated below.
 ```{r}
 predict_lgbm_b0_f1mae_daily <- predict(lgbm_mod_b0_f1mae_daily, as.matrix(Daily_WeatherData_Feats_Nov_building))
+
 predict_lgbm_b1_f1mae_daily <- predict(lgbm_mod_b1_f1mae_daily, as.matrix(Daily_WeatherData_Feats_Nov_building))
+
 predict_lgbm_b3_f1mae_daily <- predict(lgbm_mod_b3_f1mae_daily, as.matrix(Daily_WeatherData_Feats_Nov_building))
+
 predict_lgbm_b4_f1mae_daily <- predict(lgbm_mod_b4_f1mae_daily, as.matrix(Daily_WeatherData_Feats_Nov_building))
+
 predict_lgbm_b5_f1mae_daily <- predict(lgbm_mod_b5_f1mae_daily, as.matrix(Daily_WeatherData_Feats_Nov_building))
+
 predict_lgbm_b6_f1mae_daily <- predict(lgbm_mod_b6_f1mae_daily, as.matrix(Daily_WeatherData_Feats_Nov_building))
 
 predict_lgbm_b_f1mae_daily <- rbind(predict_lgbm_b0_f1mae_daily, predict_lgbm_b1_f1mae_daily, predict_lgbm_b3_f1mae_daily, predict_lgbm_b4_f1mae_daily, predict_lgbm_b5_f1mae_daily, predict_lgbm_b6_f1mae_daily)
 
-# Solar forecast October
+# Solar forecast 
 predict_lgbm_s0_f1mae_daily <- predict(lgbm_mod_s0_f1mae_daily, as.matrix(Daily_WeatherData_Feats_Nov_solar %>% select(-contains("rolling"))))
+
 predict_lgbm_s1_f1mae_daily <- predict(lgbm_mod_s1_f1mae_daily, as.matrix(Daily_WeatherData_Feats_Nov_solar))
+
 predict_lgbm_s2_f1mae_daily <- predict(lgbm_mod_s2_f1mae_daily, as.matrix(Daily_WeatherData_Feats_Nov_solar))
+
 predict_lgbm_s3_f1mae_daily <- predict(lgbm_mod_s3_f1mae_daily, as.matrix(Daily_WeatherData_Feats_Nov_solar))
+
 predict_lgbm_s4_f1mae_daily <- predict(lgbm_mod_s4_f1mae_daily, as.matrix(Daily_WeatherData_Feats_Nov_solar))
+
 predict_lgbm_s5_f1mae_daily <- predict(lgbm_mod_s5_f1mae_daily, as.matrix(Daily_WeatherData_Feats_Nov_solar))
 
 predict_lgbm_s_f1mae_daily <- rbind(predict_lgbm_s0_f1mae_daily, predict_lgbm_s1_f1mae_daily, predict_lgbm_s2_f1mae_daily, predict_lgbm_s3_f1mae_daily, predict_lgbm_s4_f1mae_daily, predict_lgbm_s5_f1mae_daily)
@@ -866,143 +523,14 @@ predict_lgbm_s_f1mae_daily[predict_lgbm_s_f1mae_daily<0.15]=0
 predict_lgbm_b_f1mae_daily[predict_lgbm_b_f1mae_daily<0.01]=0
 ```
 
-```{r}
-predict_lgbm_b0_f1mae_daily <- predict(lgbm_mod_b0_f1mae_daily, as.matrix(building_clean_weather_test_daily %>% filter(series_name=="Building0") %>% as_tibble() %>% select(-series_value, -series_name, -TimeDate)))
-
-predict_lgbm_b1_f1mae_daily <- predict(lgbm_mod_b1_f1mae_daily,as.matrix(building_clean_weather_test_daily %>% filter(series_name=="Building1") %>% as_tibble() %>% select(-series_value, -series_name, -TimeDate)))
-
-predict_lgbm_b3_f1mae_daily <- predict(lgbm_mod_b3_f1mae_daily, as.matrix(building_clean_weather_test_daily %>% filter(series_name=="Building3") %>% as_tibble() %>% select(-series_value, -series_name, -TimeDate)))
-
-predict_lgbm_b4_f1mae_daily <- predict(lgbm_mod_b4_f1mae_daily, as.matrix(building_clean_weather_test_daily %>% filter(series_name=="Building4") %>% as_tibble() %>% select(-series_value, -series_name, -TimeDate)))
-
-predict_lgbm_b5_f1mae_daily <- predict(lgbm_mod_b5_f1mae_daily, as.matrix(building_clean_weather_test_daily %>% filter(series_name=="Building5") %>% as_tibble() %>% select(-series_value, -series_name, -TimeDate)))
-
-predict_lgbm_b6_f1mae_daily <- predict(lgbm_mod_b6_f1mae_daily, as.matrix(building_clean_weather_test_daily %>% filter(series_name=="Building6") %>% as_tibble() %>% select(-series_value, -series_name, -TimeDate)))
-
-predict_lgbm_b_f1mae_daily <- rbind(predict_lgbm_b0_f1mae_daily, predict_lgbm_b1_f1mae_daily, predict_lgbm_b3_f1mae_daily, predict_lgbm_b4_f1mae_daily, predict_lgbm_b5_f1mae_daily, predict_lgbm_b6_f1mae_daily)
-
-# Solar forecast October
-predict_lgbm_s0_f1mae_daily <- predict(lgbm_mod_s0_f1mae_daily, as.matrix(solar_clean_weather_test_daily %>% filter(series_name=="Solar0") %>% as_tibble() %>% select(-series_value, -series_name, -TimeDate) %>% select(-contains("rolling"))))
-
-predict_lgbm_s1_f1mae_daily <- predict(lgbm_mod_s1_f1mae_daily, as.matrix(solar_clean_weather_test_daily %>% filter(series_name=="Solar1") %>% as_tibble() %>% select(-series_value, -series_name, -TimeDate)))
-
-predict_lgbm_s2_f1mae_daily <- predict(lgbm_mod_s2_f1mae_daily,as.matrix(solar_clean_weather_test_daily %>% filter(series_name=="Solar2") %>% as_tibble() %>% select(-series_value, -series_name, -TimeDate)))
-
-predict_lgbm_s3_f1mae_daily <- predict(lgbm_mod_s3_f1mae_daily, as.matrix(solar_clean_weather_test_daily %>% filter(series_name=="Solar3") %>% as_tibble() %>% select(-series_value, -series_name, -TimeDate)))
-
-predict_lgbm_s4_f1mae_daily <- predict(lgbm_mod_s4_f1mae_daily, as.matrix(solar_clean_weather_test_daily %>% filter(series_name=="Solar4") %>% as_tibble() %>% select(-series_value, -series_name, -TimeDate)))
-
-predict_lgbm_s5_f1mae_daily <- predict(lgbm_mod_s5_f1mae_daily, as.matrix(solar_clean_weather_test_daily %>% filter(series_name=="Solar5") %>% as_tibble() %>% select(-series_value, -series_name, -TimeDate)))
-
-predict_lgbm_s_f1mae_daily <- rbind(predict_lgbm_s0_f1mae_daily, predict_lgbm_s1_f1mae_daily, predict_lgbm_s2_f1mae_daily, predict_lgbm_s3_f1mae_daily, predict_lgbm_s4_f1mae_daily, predict_lgbm_s5_f1mae_daily)
-
-# turn small values to zero
-predict_lgbm_s_f1mae_daily[predict_lgbm_s_f1mae_daily<0.1]=0
-```
 
 ```{r}
 predict_sb_daily <- rbind(predict_lgbm_b_f1mae_daily,predict_lgbm_s_f1mae_daily)
 rownames(predict_sb_daily) <- c(buildings, solars)
-write.csv(predict_sb_daily, "i2d-Nov.csv")
+#write.csv(predict_sb_daily, "i2d-Nov.csv")
 ```
 
-
-```{r}
-# lightgbm::lgb.save(lgbm_mod_b0_f1mae_daily, "lgbm_mod_b0_f1mae_daily_nov.txt")
-# lightgbm::lgb.save(lgbm_mod_b1_f1mae_daily, "lgbm_mod_b1_f1mae_daily_nov.txt")
-# lightgbm::lgb.save(lgbm_mod_b3_f1mae_daily, "lgbm_mod_b3_f1mae_daily_nov.txt")
-# lightgbm::lgb.save(lgbm_mod_b4_f1mae_daily, "lgbm_mod_b4_f1mae_daily_nov.txt")
-# lightgbm::lgb.save(lgbm_mod_b5_f1mae_daily, "lgbm_mod_b5_f1mae_daily_nov.txt")
-# lightgbm::lgb.save(lgbm_mod_b6_f1mae_daily, "lgbm_mod_b6_f1mae_daily_nov.txt")
-# 
-# lightgbm::lgb.save(lgbm_mod_s0_f1mae_daily, "lgbm_mod_s0_f1mae_daily_nov.txt")
-# lightgbm::lgb.save(lgbm_mod_s1_f1mae_daily, "lgbm_mod_s1_f1mae_daily_nov.txt")
-# lightgbm::lgb.save(lgbm_mod_s2_f1mae_daily, "lgbm_mod_s2_f1mae_daily_nov.txt")
-# lightgbm::lgb.save(lgbm_mod_s3_f1mae_daily, "lgbm_mod_s3_f1mae_daily_nov.txt")
-# lightgbm::lgb.save(lgbm_mod_s4_f1mae_daily, "lgbm_mod_s4_f1mae_daily_nov.txt")
-# lightgbm::lgb.save(lgbm_mod_s5_f1mae_daily, "lgbm_mod_s5_f1mae_daily_nov.txt")
-
-lgbm_mod_b0_f1mae_daily <- lightgbm::lgb.load(here::here("Models","lgbm_mod_b0_f1mae_daily_oct.txt"))
-lgbm_mod_b1_f1mae_daily <- lightgbm::lgb.load(here::here("Models","lgbm_mod_b1_f1mae_daily_oct.txt"))
-lgbm_mod_b3_f1mae_daily <- lightgbm::lgb.load(here::here("Models","lgbm_mod_b3_f1mae_daily_oct.txt"))
-lgbm_mod_b4_f1mae_daily <- lightgbm::lgb.load(here::here("Models","lgbm_mod_b4_f1mae_daily_oct.txt"))
-lgbm_mod_b5_f1mae_daily <- lightgbm::lgb.load(here::here("Models","lgbm_mod_b5_f1mae_daily_oct.txt"))
-lgbm_mod_b6_f1mae_daily <- lightgbm::lgb.load(here::here("Models","lgbm_mod_b6_f1mae_daily_oct.txt"))
-
-lgbm_mod_s0_f1mae_daily <- lightgbm::lgb.load(here::here("Models","lgbm_mod_s0_f1mae_daily_oct.txt"))
-lgbm_mod_s1_f1mae_daily <- lightgbm::lgb.load(here::here("Models","lgbm_mod_s1_f1mae_daily_oct.txt"))
-lgbm_mod_s2_f1mae_daily <- lightgbm::lgb.load(here::here("Models","lgbm_mod_s2_f1mae_daily_oct.txt"))
-lgbm_mod_s3_f1mae_daily <- lightgbm::lgb.load(here::here("Models","lgbm_mod_s3_f1mae_daily_oct.txt"))
-lgbm_mod_s4_f1mae_daily <- lightgbm::lgb.load(here::here("Models","lgbm_mod_s4_f1mae_daily_oct.txt"))
-lgbm_mod_s5_f1mae_daily <- lightgbm::lgb.load(here::here("Models","lgbm_mod_s5_f1mae_daily_oct.txt"))
-```
-
-### Variable importance buildings and solars daily
-```{r eval=FALSE}
-# Feature importance
-lgbm_ImpVar_b0_daily <- lightgbm::lgb.importance(lgbm_mod_b0_f1mae_daily, percentage = TRUE)
-lgbm_ImpVar_b1_daily <- lightgbm::lgb.importance(lgbm_mod_b1_f1mae_daily, percentage = TRUE)
-lgbm_ImpVar_b3_daily <- lightgbm::lgb.importance(lgbm_mod_b3_f1mae_daily, percentage = TRUE)
-lgbm_ImpVar_b4_daily <- lightgbm::lgb.importance(lgbm_mod_b4_f1mae_daily, percentage = TRUE)
-lgbm_ImpVar_b5_daily <- lightgbm::lgb.importance(lgbm_mod_b5_f1mae_daily, percentage = TRUE)
-lgbm_ImpVar_b6_daily <- lightgbm::lgb.importance(lgbm_mod_b6_f1mae_daily, percentage = TRUE)
-
-# Save feature importance
-# saveRDS(lgbm_ImpVar_b0,  ("lgbm_ImpVar_b0.rds"))
-# saveRDS(lgbm_ImpVar_b1,  ("lgbm_ImpVar_b1.rds"))
-# saveRDS(lgbm_ImpVar_b3,  ("lgbm_ImpVar_b3.rds"))
-# saveRDS(lgbm_ImpVar_b4,  ("lgbm_ImpVar_b4.rds"))
-# saveRDS(lgbm_ImpVar_b5,  ("lgbm_ImpVar_b5.rds"))
-# saveRDS(lgbm_ImpVar_b6,  ("lgbm_ImpVar_b6.rds"))
-
-lgbm_ImpVar_s0_daily <- lightgbm::lgb.importance(lgbm_mod_s0_f1mae_daily, percentage = TRUE)
-lgbm_ImpVar_s1_daily <- lightgbm::lgb.importance(lgbm_mod_s1_f1mae_daily, percentage = TRUE)
-lgbm_ImpVar_s2_daily <- lightgbm::lgb.importance(lgbm_mod_s2_f1mae_daily, percentage = TRUE)
-lgbm_ImpVar_s3_daily <- lightgbm::lgb.importance(lgbm_mod_s3_f1mae_daily, percentage = TRUE)
-lgbm_ImpVar_s4_daily <- lightgbm::lgb.importance(lgbm_mod_s4_f1mae_daily, percentage = TRUE)
-lgbm_ImpVar_s5_daily <- lightgbm::lgb.importance(lgbm_mod_s5_f1mae_daily, percentage = TRUE)
-
-# View feature importance rank
-# lgbmSpotMod_ImpVar %>% View
-lgbm_ImpVar_s0_daily %>%
-  as_tibble() %>%
-  ggplot(aes(x = fct_reorder(Feature, Gain), y = Gain)) +
-  geom_col(alpha = 0.8) +
-  labs(title = "Feature importances ranking",
-       x = "Features") +
-  coord_flip() +
-  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
-  panel.border = element_blank(),
-  axis.line = element_line())
-```
-
-
-# post analysing daily dta
-
-```{r}
-
-predict_sb_daily %>% t() %>% as_tibble()  %>% 
-  pivot_longer(cols= c(1:12),names_to = "series_name", values_to= "Forecast") %>%
-  #arrange("Names", desc())  %>%
-  mutate(h= rep((1:2976), each=12)) %>% 
-left_join(tsibble_data_Oct  %>% as_tibble() %>%  select(TimeDate,series_value,series_name) %>% mutate(h= rep(c(1:2976), 12))) %>%
-  pivot_longer(cols = c(series_value, Forecast), names_to = "Type", values_to = "Power") %>%
-  filter(series_name == "Building5") %>%
-  ggplot(aes(x = TimeDate, y = Power, colour = Type)) +
-  geom_line() +
-  labs(title = "Forecast vs. Actual",
-       colour = NULL) +
-  #facet_wrap(~ series_name, scales = "free", ncol = 3) +
-  #scale_x_datetime(breaks = "1 hours", labels = date_format("%H:%M")) +
-  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
-        panel.border = element_blank(),
-        axis.line = element_line(),
-        legend.position = "bottom")
-```
-
-
-#### Creating data with ERA for hourly data ####
-
+## Developing models with hourly data
 
 ```{r}
 building_clean_weather_train_hourly <- building_clean_all %>% 
@@ -1030,86 +558,10 @@ solar_clean_weather_test_hourly <- solar_clean_all %>%
   left_join(ERA_Feats, by= c("Date", "Hour")) #%>% select(-TimeDate, -contains(c("WindSpeed", "Humidity", "Pressure", "Thermal"))
 ```
 
-```{r}
-Hourly_WeatherData_Feats_Sep <- ERA_Feats %>%
-  filter(TimeDate > "2020-09-01 09:00:00" & TimeDate < "2020-10-01 10:00:00") %>%
-  dplyr::slice(rep(1:n(), each = 4)) %>%
-  mutate(#Hour = rep(rep(c(0:23), each=4), 31),
-         #series_name = as.character(series_name),
-         Minute = rep(c(0,15,30,45), 30*24), #which of the four 15 minutes block in one hour it is
-         #Date = date(index),
-         #TimeDate = lubridate::ymd_hms(paste0(index, Hour, Minute)),
-         Year = year(TimeDate),
-         Month =lubridate::month(TimeDate, label= TRUE),
-         Day_of_Month = day(DateTime),
-         Day = weekdays(Date),
-         Week = week(TimeDate),
-         Season = case_when(
-           Month %in% c("Dec", "Jan", "Feb") ~ 1,
-           Month %in% c("Mar", "Apr", "May") ~ 2,
-           Month %in% c("Jun", "Jul", "Aug") ~ 3,
-           Month %in% c("Sep", "Oct", "Nov")  ~ 4),
-         Day = case_when(
-           Day == "Monday" ~ 1,
-           Day == "Tuesday" ~ 2,
-           Day == "Wednesday" ~ 3,
-           Day == "Thursday" ~ 4,
-           Day == "Friday" ~ 5,
-           Day == "Saturday" ~ 6,
-           Day == "Sunday" ~ 7)
-         ) %>% as_tibble() %>%
-  select(Date, Year, Season, Month, Day_of_Month, Day, Week, Hour, Minute, everything())
-
-Hourly_WeatherData_Feats_Sep_building <- Hourly_WeatherData_Feats_Sep %>%
-  select(Date, Year, Season, Month, Day_of_Month,Day, Week, Hour, Minute,contains(c("Temperature")), -contains("Dew"))  
-#DailyHourly_WeatherData_Feats_Oct_solar <- Daily_WeatherData_Feats_Oct_solar %>% left_join(ERA_Feats , by=c("Hour" ,"Date"))
-
-Hourly_WeatherData_Feats_Sep_solar <- Hourly_WeatherData_Feats_Sep
-
-```
-
-```{r}
-Hourly_WeatherData_Feats_Oct <- ERA_Feats %>%
-  filter(TimeDate > "2020-10-01 09:00:00" & TimeDate < "2020-11-01 11:00:00") %>%
-  dplyr::slice(rep(1:n(), each = 4)) %>%
-  mutate(#Hour = rep(rep(c(0:23), each=4), 31),
-         #series_name = as.character(series_name),
-         Minute = rep(c(0,15,30,45), 31*24), #which of the four 15 minutes block in one hour it is
-         #Date = date(index),
-         #TimeDate = lubridate::ymd_hms(paste0(index, Hour, Minute)),
-         Year = year(TimeDate),
-         Month =lubridate::month(TimeDate, label= TRUE),
-         Day_of_Month = day(DateTime),
-         Day = weekdays(Date),
-         Week = week(TimeDate),
-         Season = case_when(
-           Month %in% c("Dec", "Jan", "Feb") ~ 1,
-           Month %in% c("Mar", "Apr", "May") ~ 2,
-           Month %in% c("Jun", "Jul", "Aug") ~ 3,
-           Month %in% c("Sep", "Oct", "Nov")  ~ 4),
-         Day = case_when(
-           Day == "Monday" ~ 1,
-           Day == "Tuesday" ~ 2,
-           Day == "Wednesday" ~ 3,
-           Day == "Thursday" ~ 4,
-           Day == "Friday" ~ 5,
-           Day == "Saturday" ~ 6,
-           Day == "Sunday" ~ 7)
-         ) %>% as_tibble() %>%
-  select(Date, Year, Season, Month, Day_of_Month, Day, Week, Hour, Minute, everything())
-
-
-Hourly_WeatherData_Feats_Oct_building <- Hourly_WeatherData_Feats_Oct %>%
-  select(Date, Year, Season, Month, Day_of_Month,Day, Week, Hour, Minute,contains(c("Temperature")), -contains("Dew"))  
-#DailyHourly_WeatherData_Feats_Oct_solar <- Daily_WeatherData_Feats_Oct_solar %>% left_join(ERA_Feats , by=c("Hour" ,"Date"))
-
-Hourly_WeatherData_Feats_Oct_solar <- Hourly_WeatherData_Feats_Oct #%>%
-  #select(-TimeDate)#, -contains(c("WindSpeed", "Humidity", "Pressure", "Thermal")))# %>% select(-contains("lag"), -contains("rolling"))
-```
 
 ```{r}
 Hourly_WeatherData_Feats_Nov <- ERA_Feats %>%
-  filter(TimeDate > "2020-11-01 10:00:00" & TimeDate < "2020-12-01 11:00:00") %>%
+  filter(TimeDate >= "2020-11-01 03:30:00" & TimeDate < "2020-12-01 03:30:00") %>%
   dplyr::slice(rep(1:n(), each = 4)) %>%
   mutate(#Hour = rep(rep(c(0:23), each=4), 31),
          #series_name = as.character(series_name),
@@ -1138,14 +590,14 @@ Hourly_WeatherData_Feats_Nov <- ERA_Feats %>%
   select(Date, Year, Season, Month, Day_of_Month, Day, Week, Hour, Minute, everything())
 
 Hourly_WeatherData_Feats_Nov_building <- Hourly_WeatherData_Feats_Nov %>%
-  select(Date, Year, Season, Month, Day_of_Month,Day, Week, Hour, Minute,contains(c("Temperature")), -contains("Dew"))  
-#DailyHourly_WeatherData_Feats_Oct_solar <- Daily_WeatherData_Feats_Oct_solar %>% left_join(ERA_Feats , by=c("Hour" ,"Date"))
+  select(Date, Year, Season, Month, Day_of_Month,Day, Week, Hour, Minute,contains(c("Temperature")), -contains("Dew"))
 
 Hourly_WeatherData_Feats_Nov_solar <- Hourly_WeatherData_Feats_Nov
 ```
 
 
 ## Models with hourly data
+
 ```{r}
 lgbm_mod_b0_f1mae_hourly <- lightgbm::lightgbm(
   data = as.matrix(building_clean_weather_train_hourly %>% filter(series_name=="Building0") %>%
@@ -1411,28 +863,39 @@ lgbm_mod_s5_f1mae_hourly  <- lightgbm::lightgbm(
   verbose = -1)
 ```
 
-
-## Prediction with hourly data
+Predictions for November with hourly data is done below:
 ```{r}
-# Read testSetForecastSpot
 predict_lgbm_b0_f1mae_hourly <- predict(lgbm_mod_b0_f1mae_hourly, as.matrix(Hourly_WeatherData_Feats_Nov_building))
+
 predict_lgbm_b1_f1mae_hourly <- predict(lgbm_mod_b1_f1mae_hourly, as.matrix(Hourly_WeatherData_Feats_Nov_building))
+
 predict_lgbm_b3_f1mae_hourly <- predict(lgbm_mod_b3_f1mae_hourly, as.matrix(Hourly_WeatherData_Feats_Nov_building))
+
 predict_lgbm_b4_f1mae_hourly <- predict(lgbm_mod_b4_f1mae_hourly, as.matrix(Hourly_WeatherData_Feats_Nov_building))
+
 predict_lgbm_b5_f1mae_hourly <- predict(lgbm_mod_b5_f1mae_hourly, as.matrix(Hourly_WeatherData_Feats_Nov_building))
+
 predict_lgbm_b6_f1mae_hourly <- predict(lgbm_mod_b6_f1mae_hourly, as.matrix(Hourly_WeatherData_Feats_Nov_building))
 
 predict_lgbm_b_f1mae_hourly <- rbind(predict_lgbm_b0_f1mae_hourly, predict_lgbm_b1_f1mae_hourly, predict_lgbm_b3_f1mae_hourly, predict_lgbm_b4_f1mae_hourly, predict_lgbm_b5_f1mae_hourly, predict_lgbm_b6_f1mae_hourly)
 predict_lgbm_b_f1mae_hourly[predict_lgbm_b_f1mae_hourly<0.01]=0
+
 # Solar forecast October
 predict_lgbm_s0_f1mae_hourly <- predict(lgbm_mod_s0_f1mae_hourly, as.matrix(Hourly_WeatherData_Feats_Nov_solar %>% select(-contains("rolling"))))
+
 predict_lgbm_s1_f1mae_hourly <- predict(lgbm_mod_s1_f1mae_hourly, as.matrix(Hourly_WeatherData_Feats_Nov_solar))
+
 predict_lgbm_s2_f1mae_hourly <- predict(lgbm_mod_s2_f1mae_hourly, as.matrix(Hourly_WeatherData_Feats_Nov_solar))
+
 predict_lgbm_s3_f1mae_hourly <- predict(lgbm_mod_s3_f1mae_hourly, as.matrix(Hourly_WeatherData_Feats_Nov_solar))
+
 predict_lgbm_s4_f1mae_hourly <- predict(lgbm_mod_s4_f1mae_hourly, as.matrix(Hourly_WeatherData_Feats_Nov_solar))
+
 predict_lgbm_s5_f1mae_hourly <- predict(lgbm_mod_s5_f1mae_hourly, as.matrix(Hourly_WeatherData_Feats_Nov_solar))
 
 predict_lgbm_s_f1mae_hourly <- rbind(predict_lgbm_s0_f1mae_hourly, predict_lgbm_s1_f1mae_hourly, predict_lgbm_s2_f1mae_hourly, predict_lgbm_s3_f1mae_hourly, predict_lgbm_s4_f1mae_hourly, predict_lgbm_s5_f1mae_hourly)
+
+#replacing small values with zero
 predict_lgbm_s_f1mae_hourly[predict_lgbm_s_f1mae_hourly<0.15]=0
 ```
 
@@ -1440,490 +903,20 @@ predict_lgbm_s_f1mae_hourly[predict_lgbm_s_f1mae_hourly<0.15]=0
 ```{r}
 predict_sb_h <- rbind(predict_lgbm_b_f1mae_hourly,predict_lgbm_s_f1mae_hourly)
 rownames(predict_sb_h) <- c(buildings, solars)
-write.csv(predict_sb_h, "i2h-Nov.csv")
+#write.csv(predict_sb_h, "i2h-Nov.csv")
 ```
 
-Final forecast used in the competition. 
+Final forecast used in the competition. We take the average of solar and buildings forecasts. 
 ```{r}
-psb <- (predict_sb_h + predict_sb_daily)/2
+#prediction solars buildings
+pre_solar_building <- (predict_sb_h + predict_sb_daily)/2
 ```
 
+Plotting data to see how it performs.
 ```{r}
 bind_rows(tsibble_data_Oct  %>% as_tibble() %>% 
     select(TimeDate,series_value,series_name),predict_sb_daily %>% t() %>% as_tibble()  %>% 
     pivot_longer(cols= c(1:12),names_to = "series_name", values_to= "series_value") %>%
     mutate(h= rep((1:2880), each=12))) %>%
     filter(series_name == "Building0") %>% pull(series_value) %>% plot.ts()
-
 ```
-
-
-```{r}
-# lightgbm::lgb.save(lgbm_mod_b0_f1mae, "lgbm_mod_b0_f1mae_hourly_sep.txt")
-# lightgbm::lgb.save(lgbm_mod_b1_f1mae , "lgbm_mod_b1_f1mae_hourly_sep.txt")
-# lightgbm::lgb.save(lgbm_mod_b3_f1mae , "lgbm_mod_b3_f1mae_hourly_sep.txt")
-# lightgbm::lgb.save(lgbm_mod_b4_f1mae , "lgbm_mod_b4_f1mae_hourly_sep.txt")
-# lightgbm::lgb.save(lgbm_mod_b5_f1mae , "lgbm_mod_b5_f1mae_hourly_sep.txt")
-# lightgbm::lgb.save(lgbm_mod_b6_f1mae , "lgbm_mod_b6_f1mae_hourly_sep.txt")
-# 
- lightgbm::lgb.save(lgbm_mod_s0_f1mae_hourly , "lgbm_mod_s0_f1mae_hourly_oct.txt")
-# lightgbm::lgb.save(lgbm_mod_s1_f1mae , "lgbm_mod_s1_f1mae_hourly_sep.txt")
-# lightgbm::lgb.save(lgbm_mod_s2_f1mae , "lgbm_mod_s2_f1mae_hourly_sep.txt")
-# lightgbm::lgb.save(lgbm_mod_s3_f1mae , "lgbm_mod_s3_f1mae_hourly_sep.txt")
-# lightgbm::lgb.save(lgbm_mod_s4_f1mae , "lgbm_mod_s4_f1mae_hourly_sep.txt")
-# lightgbm::lgb.save(lgbm_mod_s5_f1mae , "lgbm_mod_s5_f1mae_hourly_sep.txt")
-
-lgbm_mod_b0_f1mae_hourly <- lightgbm::lgb.load(here::here("Models","lgbm_mod_b0_f1mae_hourly_oct.txt"))
-lgbm_mod_b1_f1mae_hourly <- lightgbm::lgb.load(here::here("Models","lgbm_mod_b1_f1mae_hourly_oct.txt"))
-lgbm_mod_b3_f1mae_hourly <- lightgbm::lgb.load(here::here("Models","lgbm_mod_b3_f1mae_hourly_oct.txt"))
-lgbm_mod_b4_f1mae_hourly <- lightgbm::lgb.load(here::here("Models","lgbm_mod_b4_f1mae_hourly_oct.txt"))
-lgbm_mod_b5_f1mae_hourly <- lightgbm::lgb.load(here::here("Models","lgbm_mod_b5_f1mae_hourly_oct.txt"))
-lgbm_mod_b6_f1mae_hourly <- lightgbm::lgb.load(here::here("Models","lgbm_mod_b6_f1mae_hourly_oct.txt"))
-
-lgbm_mod_s0_f1mae_hourly <- lightgbm::lgb.load(here::here("Models","lgbm_mod_s0_f1mae_hourly_oct.txt"))
-lgbm_mod_s1_f1mae_hourly <- lightgbm::lgb.load(here::here("Models","lgbm_mod_s1_f1mae_hourly_oct.txt"))
-lgbm_mod_s2_f1mae_hourly <- lightgbm::lgb.load(here::here("Models","lgbm_mod_s2_f1mae_hourly_oct.txt"))
-lgbm_mod_s3_f1mae_hourly <- lightgbm::lgb.load(here::here("Models","lgbm_mod_s3_f1mae_hourly_oct.txt"))
-lgbm_mod_s4_f1mae_hourly <- lightgbm::lgb.load(here::here("Models","lgbm_mod_s4_f1mae_hourly_oct.txt"))
-lgbm_mod_s5_f1mae_hourly <- lightgbm::lgb.load(here::here("Models","lgbm_mod_s5_f1mae_hourly_oct.txt"))
-```
-
-
-## Creating daily-hourly data
-
-```{r}
-building_clean_weather_daily_hourly <- building_clean_all %>% 
-  filter(Date < "2020-11-01") %>%
-  select(-start_timestamp,series_name, Year, Date, Season, Month, Week, Day_of_Month,Day, Hour, Minute) %>%
-  left_join(ERA_Feats %>% select(Date, Hour, contains("Temperature"), -contains("Dew")), by= c("Date", "Hour"))  %>%
-    distinct_at(vars(series_name, TimeDate), .keep_all = TRUE) %>%
-left_join(building_clean_weather_daily %>% select(-Year, -Date, -Season,-series_value, -Month, -Week, -Day_of_Month,-Day, -Hour, -Minute) %>%  distinct_at(vars(series_name, TimeDate), .keep_all = TRUE), by= c("TimeDate","series_name"))
-
-building_clean_weather_train_daily_hourly <- building_clean_weather_daily_hourly %>% 
-  filter(Date < "2020-11-01") %>% select(-contains("Expo"))
-
-building_clean_weather_test_daily_hourly <- building_clean_weather_daily_hourly %>% 
-  filter(Date >= "2020-09-01" & Date < "2020-11-01") %>% select(-contains("Expo")) %>%
-  replace_with_na(list(series_value=1744.1)) ## this is the big outlier in
-```
-
-
-```{r}
-solar_clean_weather_daily_hourly <- solar_clean_all %>% 
-  filter(Date < "2020-11-01") %>%
-  select(-start_timestamp,series_name, Year, Date, Season, Month, Week, Day_of_Month,Day, Hour, Minute) %>%
-  left_join(ERA_Feats %>% select(-TimeDate), by= c("Date", "Hour"))  %>%
-  distinct_at(vars(series_name, TimeDate), .keep_all = TRUE) %>%
-  left_join(solar_clean_weather_daily %>% select(-Year, -Date, -Season,-series_value, -Month, -Week, -Day_of_Month,-Day, -Hour, -Minute) %>%  distinct_at(vars(series_name, TimeDate), .keep_all = TRUE), by= c("TimeDate","series_name"))
-
-solar_clean_weather_train_daily_hourly <- solar_clean_weather_daily_hourly %>% 
-  filter(Date < "2020-11-01") %>%    select(-RainFall_rollingMean_2_day, -RainFall_rollingSd_3_day)
-
-
-solar_clean_weather_test_daily_hourly <- solar_clean_weather_daily_hourly %>% 
-  filter(Date >= "2020-09-01" & Date < "2020-11-01")
-```
-
-
-```{r}
-saveRDS(solar_clean_weather_train_daily_hourly, "solar_clean_weather_train_daily_hourly.rds")
-saveRDS(building_clean_weather_train_daily_hourly, "building_clean_weather_train_daily_hourly.rds")
-saveRDS(solar_clean_weather_train_hourly, "solar_clean_weather_train_hourly.rds")
-saveRDS(building_clean_weather_train_hourly, "building_clean_weather_train_hourly.rds")
-saveRDS(solar_clean_weather_train_daily, "solar_clean_weather_train_daily.rds")
-saveRDS(building_clean_weather_train_daily, "building_clean_weather_train_daily.rds")
-
-```
-
-```{r}
-saveRDS(solar_clean_weather_test_daily_hourly, "solar_clean_weather_test_daily_hourly.rds")
-saveRDS(building_clean_weather_test_daily_hourly, "building_clean_weather_test_daily_hourly.rds")
-saveRDS(solar_clean_weather_test_hourly, "solar_clean_weather_test_hourly.rds")
-saveRDS(building_clean_weather_test_hourly, "building_clean_weather_test_hourly.rds")
-saveRDS(solar_clean_weather_test_daily, "solar_clean_weather_test_daily.rds")
-saveRDS(building_clean_weather_test_daily, "building_clean_weather_test_daily.rds")
-```
-
-
-```{r}
-Daily_hourly_WeatherData_Feats_Nov_solar <- Daily_WeatherData_Feats_Nov_solar %>% select(contains(c("Avg", "_day"))) %>% bind_cols(Hourly_WeatherData_Feats_Nov_solar) %>% 
-    select(Year, Date, Season, Month, Week, Day_of_Month,Day, Hour, Minute, everything()) %>%
-    select(-RainFall_rollingMean_2_day, -RainFall_rollingSd_3_day)
-
-
-
-Daily_hourly_WeatherData_Feats_Nov_building <-  Daily_WeatherData_Feats_Nov_building %>% select(contains(c("Avg", "_day"))) %>% bind_cols(Hourly_WeatherData_Feats_Nov_building) %>%
-      select(Year, Date, Season, Month, Week, Day_of_Month,Day, Hour, Minute, everything())
-```
-
-## Models and Predictions with daily hourly data
-
-```{r}
-lgbm_mod_b0_f1mae_daily_hourly <- lightgbm::lightgbm(
-  data = as.matrix(building_clean_weather_train_daily_hourly %>% filter(series_name=="Building0") %>%
-                     filter(Date>="2020-09-01" & Date< "2020-11-01") %>% #use this data for October/November
-                     #filter(Date >="2020-08-01") %>% #use this date for sep test
-                     as_tibble() %>%
-                     select(-start_timestamp,-series_value, -series_name, -TimeDate)),
-  label = building_clean_weather_train_daily_hourly  %>% filter(series_name=="Building0") %>%
-    filter(Date>="2020-09-01" & Date< "2020-11-01") %>% pull(series_value),
-  num_leaves = 20,  
-  max_depth = 7, 
-  learning_rate = 0.1, 
-  nrounds = 48, #9,  
-  min_data_in_leaf = 50,
-  #feature_fraction = 0.7,
-  #bagging_fraction = 0.7,
-  objective = "mae", 
-  num_threads = 8, 
-  boosting = "gbdt", 
-  lambda_l1 = 0.1, 
-  verbose = -1)
-
-
-# Remove objects
-#rm(list = ls())
-lgbm_mod_b1_f1mae_daily_hourly  <- lightgbm::lightgbm(
-  data = as.matrix( building_clean_weather_train_daily_hourly %>% filter(series_name=="Building1") %>%
-                      as_tibble() %>% 
-                      filter(Date< "2020-11-01") %>%
-                      select(-start_timestamp,-series_value, -series_name, -TimeDate)),
-  label = building_clean_weather_train_daily_hourly %>% filter(series_name=="Building1") %>% 
-    filter(Date< "2020-11-01") %>% pull(series_value),
-  #force_row_wise = TRUE,
-  num_leaves = 180L,
-  learning_rate = 0.1,
-  max_depth = 12,
-  nrounds = 50,#24,
-  #feature_fraction = 0.7,
-  #bagging_fraction = 0.7,
-  min_data_in_leaf = 80,
-  objective = "mae",
-  num_threads = 8, 
-  lambda_l1 = 0.1, ## adding this is useful
-  verbose = -1)
-
-lgbm_mod_b3_f1mae_daily_hourly  <- lightgbm::lightgbm(
-  data = as.matrix(building_clean_weather_train_daily_hourly %>% filter(series_name=="Building3") %>%
-                     filter(Date >= "2020-09-01" & Date< "2020-11-01") %>% #use this data for October
-                     #filter(Date>="2020-08-01") %>% #use this date for sep test
-                     as_tibble() %>% select(-start_timestamp,-series_value, -series_name, -TimeDate)),
-  label = building_clean_weather_train_daily_hourly %>% filter(series_name=="Building3") %>%
-    filter(Date>="2020-09-01" & Date< "2020-11-01") %>% pull(series_value),
-  #force_row_wise = TRUE,
-  num_leaves = 100L,
-  max_depth = 8,
-  learning_rate = 0.1,
-  nrounds = 42L,
-  min_data_in_leaf = 80,
-  #feature_fraction = 0.7,
-  #bagging_fraction = 0.7,
-  objective = "mae",
-  num_threads = 8, 
-  lambda_l1 = 0.1,  
-  verbose = -1)
-
-lgbm_mod_b4_f1mae_daily_hourly  <- lightgbm::lightgbm(
-  data = as.matrix(building_clean_weather_train_daily_hourly %>% filter(series_name=="Building4")  %>%
-                     as_tibble()  %>%
-                     filter( Date< "2020-11-01") %>% 
-                     select(-start_timestamp,-series_value, -series_name, -TimeDate)),
-  label = building_clean_weather_train_daily_hourly %>% filter(series_name=="Building4")  %>%
-    filter( Date< "2020-11-01") %>% pull(series_value),
-  num_leaves = 30L,  
-  max_depth = 9,#9,  
-  learning_rate = 0.1,  
-  nrounds = 50,  
-  #feature_fraction = 0.7,
-  #bagging_fraction = 0.7, 
-  min_data_in_leaf = 50,
-  objective = "mae", 
-  num_threads = 8, 
-  boosting = "gbdt",  
-  lambda_l1 = 0.1, 
-  verbose = -1)
-
-
-lgbm_mod_b5_f1mae_daily_hourly  <- lightgbm::lightgbm(
-  data = as.matrix(building_clean_weather_train_daily_hourly %>% filter(series_name=="Building5") %>%
-                     as_tibble() %>% filter(Date >= "2020-01-01" & Date< "2020-11-01") %>%
-                     select(-start_timestamp,-series_value, -series_name, -TimeDate)),
-  label = building_clean_weather_train_daily_hourly %>% filter(series_name=="Building5")  %>%
-    filter(Date >= "2020-01-01" & Date< "2020-11-01") %>%
-    pull(series_value),
-  num_leaves = 80,  
-  max_depth = 7,  
-  learning_rate = 0.1,
-  nrounds = 12,#4,
-  #feature_fraction = 0.7,
-  #bagging_fraction = 0.7,
-  min_data_in_leaf = 50,
-  objective = "mae",  
-  num_threads = 8, 
-  boosting = "gbdt",  
-  lambda_l1 = 0.1,  
-  verbose = -1)
-
-lgbm_mod_b6_f1mae_daily_hourly  <- lightgbm::lightgbm(
-  data = as.matrix(building_clean_weather_train_daily_hourly %>% filter(series_name=="Building6") %>%
-                     as_tibble()  %>%
-                     filter(Date >= "2020-01-01" & Date< "2020-11-01")%>%
-                     select(-start_timestamp,-series_value, -series_name, -TimeDate)),
-  label = building_clean_weather_train_daily_hourly %>% filter(series_name=="Building6") %>% 
-    filter(Date >= "2020-01-01" & Date< "2020-11-01") %>% pull(series_value),
-  #force_row_wise = TRUE,
-  num_leaves = 80L,
-  learning_rate = 0.1,
-  max_depth = 10,
-  nrounds = 20,#9L, 
-  min_data_in_leaf = 150,
-  #feature_fraction = 0.7,
-  #bagging_fraction = 0.7,
-  objective = "mae",  
-  num_threads = 8, 
-  boosting = "gbdt", 
-  lambda_l1 = 0.1, 
-  verbose = -1)
-
-
-# One-month LightGBM mod
-lgbm_mod_s0_f1mae_daily_hourly  <- lightgbm::lightgbm(
-  data = as.matrix(solar_clean_weather_train_daily_hourly %>% filter(series_name=="Solar0") %>%
-                     as_tibble()  %>%
-                     filter(Date >= "2020-09-01" & Date< "2020-11-01") %>%  
-                     #filter(Date >= "2020-09-01") %>% #use this data for October
-                     #filter(Date>="2020-08-01") %>% #use this date for sep test
-                     select(-series_value, -series_name, -TimeDate, -contains("rolling"))),
-  label = solar_clean_weather_train_daily_hourly %>% filter(series_name=="Solar0")  %>%
-    filter(Date >= "2020-09-01" & Date< "2020-11-01") %>%
-    #filter(Date >= "2020-09-01") %>%
-    pull(series_value),
-  #force_row_wise = TRUE,
-  num_leaves =30, # this is importnat too
-  max_depth = 11,  
-  learning_rate = 0.1, 
-  nrounds = 204,#34,  
-  min_data_in_leaf = 200, 
-  #feature_fraction = 0.7,
-  #bagging_fraction = 0.7,
-  objective = "mae",  
-  num_threads = 8, 
-  boosting = "gbdt",  
-  lambda_l1 = 0.1,  
-  verbose = -1)
-
-
-# Remove objects
-#rm(list = ls())
-lgbm_mod_s1_f1mae_daily_hourly  <- lightgbm::lightgbm(
-  data = as.matrix(solar_clean_weather_train_daily_hourly %>% filter(series_name=="Solar1") %>%
-                     as_tibble()  %>%
-                     filter(Date< "2020-11-01") %>% select(-series_value, -series_name, -TimeDate)),
-  label = solar_clean_weather_train_daily_hourly %>% filter(series_name=="Solar1")  %>%
-    filter(Date< "2020-11-01") %>% pull(series_value),
-  force_row_wise = TRUE,
-  num_leaves = 50L,  
-  max_depth = 7, 
-  learning_rate = 0.1,  
-  nrounds = 130,#22L,  
-  #feature_fraction = 0.7,
-  #bagging_fraction = 0.7,
-  min_data_in_leaf = 120,  
-  objective = "mae", 
-  num_threads = 8, 
-  boosting = "gbdt", 
-  lambda_l1 = 0.1,  
-  verbose = -1)
-
-
-lgbm_mod_s2_f1mae_daily_hourly  <- lightgbm::lightgbm(
-  data = as.matrix(solar_clean_weather_train_daily_hourly %>% filter(series_name=="Solar2") %>%
-                     as_tibble()  %>%
-                     filter(Date< "2020-11-01") %>% select(-series_value, -TimeDate, -series_name)),
-  label = solar_clean_weather_train_daily_hourly %>% filter(series_name=="Solar2")  %>%
-    filter(Date< "2020-11-01") %>% pull(series_value),
-  force_row_wise = TRUE,
-  num_leaves = 80L,  
-  max_depth = 10, 
-  learning_rate = 0.1, 
-  nrounds = 64,#8L,  
-  min_data_in_leaf = 300, 
-  #feature_fraction = 0.7,
-  #bagging_fraction = 0.7,
-  objective = "mae", 
-  num_threads = 8, 
-  boosting = "gbdt", 
-  lambda_l1 = 0.1,
-  verbose = -1)
-
-
-lgbm_mod_s3_f1mae_daily_hourly  <- lightgbm::lightgbm(
-  data = as.matrix(solar_clean_weather_train_daily_hourly %>% filter(series_name=="Solar3")  %>%
-                     as_tibble() %>% 
-                     filter(Date >= "2020-09-01" & Date< "2020-11-01") %>%
-                     #filter(Date>= "2020-09-01") %>% #use this data for October/November
-                     #filter(Date>="2020-08-01") %>% #use this date for sep test
-                     select(-series_value, -TimeDate, -series_name)),
-  label = solar_clean_weather_train_daily_hourly %>% filter(series_name=="Solar3") %>%
-    filter(Date >= "2020-09-01" & Date< "2020-11-01") %>%
-    #filter(Date>= "2020-09-01") %>%
-    pull(series_value),
-  force_row_wise = TRUE,
-  num_leaves = 20L,  
-  max_depth = 7,  
-  learning_rate = 0.1,  
-  nrounds = 280,#20L,  
-  #feature_fraction = 0.7,
-  #bagging_fraction = 0.7,
-  min_data_in_leaf = 80,
-  objective = "mae",  
-  num_threads = 8, 
-  boosting = "gbdt", 
-  lambda_l1 = 0.1,  
-  verbose = -1)
-
-
-lgbm_mod_s4_f1mae_daily_hourly  <- lightgbm::lightgbm(
-  data = as.matrix(solar_clean_weather_train_daily_hourly %>% filter(series_name=="Solar4")  %>%
-                     filter( Date< "2020-11-01") %>%
-                     as_tibble() %>% select(-series_value, -series_name, -TimeDate)),
-  label = solar_clean_weather_train_daily_hourly %>% filter(series_name=="Solar4")  %>%
-    filter(Date< "2020-11-01") %>% pull(series_value),
-  force_row_wise = TRUE,
-  num_leaves = 100L,  
-  max_depth = 8,  
-  learning_rate = 0.1,  
-  nrounds = 58,#15L, 
-  min_data_in_leaf = 50,
-  #feature_fraction = 0.7,
-  #bagging_fraction = 0.7,
-  objective = "mae", 
-  num_threads = 8, 
-  boosting = "gbdt", 
-  lambda_l1 = 0.1, 
-  verbose = -1)
-
-
-lgbm_mod_s5_f1mae_daily_hourly  <- lightgbm::lightgbm(
-  data = as.matrix(solar_clean_weather_train_daily_hourly %>% filter(series_name=="Solar5") %>%
-                     as_tibble()  %>%
-                     filter(Date< "2020-11-01") %>% select(-series_value, -series_name, -TimeDate)),
-  label = solar_clean_weather_train_daily_hourly %>% filter(series_name=="Solar5")  %>%
-    filter(Date< "2020-11-01") %>% pull(series_value),
-  force_row_wise = TRUE,
-  num_leaves = 80L, 
-  max_depth = 10, 
-  learning_rate = 0.1, 
-  nrounds = 83,#10L,  
-  min_data_in_leaf = 50,
-  #feature_fraction = 0.7,
-  #bagging_fraction = 0.7,
-  objective = "mae",  
-  num_threads = 8, 
-  boosting = "gbdt",  
-  lambda_l1 = 0.1,
-  verbose = -1)
-```
-
-```{r, eval=FALSE}
-predict_lgbm_b0_f1mae_daily_hourly <- predict(lgbm_mod_b0_f1mae_daily_hourly, as.matrix(building_clean_weather_test_daily_hourly %>% filter(series_name=="Building0") %>% select(-series_name, -series_value) %>%  filter(Date>="2020-10-01" & Date< "2020-11-01")))
-
-predict_lgbm_b1_f1mae_daily_hourly <- predict(lgbm_mod_b1_f1mae_daily_hourly, as.matrix(building_clean_weather_test_daily_hourly %>% filter(series_name=="Building1") %>% select(-series_name, -series_value) %>%  filter(Date>="2020-10-01" & Date< "2020-11-01")))
-
-predict_lgbm_b3_f1mae_daily_hourly <- predict(lgbm_mod_b3_f1mae_daily_hourly, as.matrix(building_clean_weather_test_daily_hourly %>% filter(series_name=="Building3") %>% select(-series_name, -series_value) %>%  filter(Date>="2020-10-01" & Date< "2020-11-01")))
-
-predict_lgbm_b4_f1mae_daily_hourly <- predict(lgbm_mod_b4_f1mae_daily_hourly, as.matrix(building_clean_weather_test_daily_hourly %>% filter(series_name=="Building4") %>% select(-series_name, -series_value) %>%  filter(Date>="2020-10-01" & Date< "2020-11-01")))
-
-predict_lgbm_b5_f1mae_daily_hourly <- predict(lgbm_mod_b5_f1mae_daily_hourly, as.matrix(building_clean_weather_test_daily_hourly %>% filter(series_name=="Building5") %>% select(-series_name, -series_value) %>%  filter(Date>="2020-10-01" & Date< "2020-11-01")))
-
-predict_lgbm_b6_f1mae_daily_hourly <- predict(lgbm_mod_b6_f1mae_daily_hourly, as.matrix(building_clean_weather_test_daily_hourly %>% filter(series_name=="Building6") %>% select(-series_name, -series_value) %>%  filter(Date>="2020-10-01" & Date< "2020-11-01")))
-
-predict_lgbm_b_f1mae_daily_hourly <- rbind(predict_lgbm_b0_f1mae_daily_hourly, predict_lgbm_b1_f1mae_daily_hourly, predict_lgbm_b3_f1mae_daily_hourly, predict_lgbm_b4_f1mae_daily_hourly, predict_lgbm_b5_f1mae_daily_hourly, predict_lgbm_b6_f1mae_daily_hourly)
-
-# Solar forecast October
-predict_lgbm_s0_f1mae_daily_hourly <- predict(lgbm_mod_s0_f1mae_daily_hourly, as.matrix(solar_clean_weather_test_daily_hourly %>% filter(series_name=="Solar0") %>% select(-series_name, -series_value,-contains("rolling")) %>%  filter(Date>="2020-10-01" & Date< "2020-11-01")))
-
-predict_lgbm_s1_f1mae_daily_hourly <- predict(lgbm_mod_s1_f1mae_daily_hourly, as.matrix(solar_clean_weather_test_daily_hourly %>% filter(series_name=="Solar1") %>% select(-series_name, -series_value)%>%  filter(Date>="2020-10-01" & Date< "2020-11-01")))
-
-predict_lgbm_s2_f1mae_daily_hourly <- predict(lgbm_mod_s2_f1mae_daily_hourly, as.matrix(solar_clean_weather_test_daily_hourly %>% filter(series_name=="Solar3") %>% select(-series_name, -series_value) %>%  filter(Date>="2020-10-01" & Date< "2020-11-01")))
-
-predict_lgbm_s3_f1mae_daily_hourly <- predict(lgbm_mod_s3_f1mae_daily_hourly, as.matrix(solar_clean_weather_test_daily_hourly %>% filter(series_name=="Solar3") %>% select(-series_name, -series_value) %>%  filter(Date>="2020-10-01" & Date< "2020-11-01")))
-
-predict_lgbm_s4_f1mae_daily_hourly <- predict(lgbm_mod_s4_f1mae_daily_hourly, as.matrix(solar_clean_weather_test_daily_hourly %>% filter(series_name=="Solar4") %>% select(-series_name, -series_value) %>%  filter(Date>="2020-10-01" & Date< "2020-11-01")))
-
-predict_lgbm_s5_f1mae_daily_hourly <- predict(lgbm_mod_s5_f1mae_daily_hourly, as.matrix(solar_clean_weather_test_daily_hourly %>% filter(series_name=="Solar5") %>% select(-series_name, -series_value) %>%  filter(Date>="2020-10-01" & Date< "2020-11-01")))
-
-predict_lgbm_s_f1mae_daily_hourly <- rbind(predict_lgbm_s0_f1mae_daily_hourly, predict_lgbm_s1_f1mae_daily_hourly, predict_lgbm_s2_f1mae_daily_hourly, predict_lgbm_s3_f1mae_daily_hourly, predict_lgbm_s4_f1mae_daily_hourly, predict_lgbm_s5_f1mae_daily_hourly)
-
-# turn small values to zero
-predict_lgbm_s_f1mae_daily_hourly[predict_lgbm_s_f1mae_daily_hourly<0.1]=0
-predict_lgbm_b_f1mae_daily_hourly[predict_lgbm_b_f1mae_daily_hourly<0.01]=0
-```
-
-
-```{r}
-predict_lgbm_b0_f1mae_daily_hourly <- predict(lgbm_mod_b0_f1mae_daily_hourly, as.matrix(Daily_hourly_WeatherData_Feats_Nov_building))
-
-predict_lgbm_b1_f1mae_daily_hourly <- predict(lgbm_mod_b1_f1mae_daily_hourly, as.matrix(Daily_hourly_WeatherData_Feats_Nov_building))
-
-predict_lgbm_b3_f1mae_daily_hourly <- predict(lgbm_mod_b3_f1mae_daily_hourly, as.matrix(Daily_hourly_WeatherData_Feats_Nov_building))
-
-predict_lgbm_b4_f1mae_daily_hourly <- predict(lgbm_mod_b4_f1mae_daily_hourly, as.matrix(Daily_hourly_WeatherData_Feats_Nov_building))
-
-predict_lgbm_b5_f1mae_daily_hourly <- predict(lgbm_mod_b5_f1mae_daily_hourly, as.matrix(Daily_hourly_WeatherData_Feats_Nov_building))
-
-predict_lgbm_b6_f1mae_daily_hourly <- predict(lgbm_mod_b6_f1mae_daily_hourly, as.matrix(Daily_hourly_WeatherData_Feats_Nov_building))
-
-predict_lgbm_b_f1mae_daily_hourly <- rbind(predict_lgbm_b0_f1mae_daily_hourly, predict_lgbm_b1_f1mae_daily_hourly, predict_lgbm_b3_f1mae_daily_hourly, predict_lgbm_b4_f1mae_daily_hourly, predict_lgbm_b5_f1mae_daily_hourly, predict_lgbm_b6_f1mae_daily_hourly)
-
-# Solar forecast October
-predict_lgbm_s0_f1mae_daily_hourly <- predict(lgbm_mod_s0_f1mae_daily_hourly, as.matrix(Daily_hourly_WeatherData_Feats_Nov_solar %>% select(-contains("rolling"))))
-
-predict_lgbm_s1_f1mae_daily_hourly <- predict(lgbm_mod_s1_f1mae_daily_hourly, as.matrix(Daily_hourly_WeatherData_Feats_Nov_solar))
-
-predict_lgbm_s2_f1mae_daily_hourly <- predict(lgbm_mod_s2_f1mae_daily_hourly, as.matrix(Daily_hourly_WeatherData_Feats_Nov_solar))
-
-predict_lgbm_s3_f1mae_daily_hourly <- predict(lgbm_mod_s3_f1mae_daily_hourly, as.matrix(Daily_hourly_WeatherData_Feats_Nov_solar))
-
-predict_lgbm_s4_f1mae_daily_hourly <- predict(lgbm_mod_s4_f1mae_daily_hourly, as.matrix(Daily_hourly_WeatherData_Feats_Nov_solar))
-
-predict_lgbm_s5_f1mae_daily_hourly <- predict(lgbm_mod_s5_f1mae_daily_hourly, as.matrix(Daily_hourly_WeatherData_Feats_Nov_solar))
-
-predict_lgbm_s_f1mae_daily_hourly <- rbind(predict_lgbm_s0_f1mae_daily_hourly, predict_lgbm_s1_f1mae_daily_hourly, predict_lgbm_s2_f1mae_daily_hourly, predict_lgbm_s3_f1mae_daily_hourly, predict_lgbm_s4_f1mae_daily_hourly, predict_lgbm_s5_f1mae_daily_hourly)
-
-# turn small values to zero
-predict_lgbm_s_f1mae_daily_hourly[predict_lgbm_s_f1mae_daily_hourly<0.1]=0
-predict_lgbm_b_f1mae_daily_hourly[predict_lgbm_b_f1mae_daily_hourly<0.01]=0
-```
-
-```{r}
-predict_sb_daily_hourly <- rbind(predict_lgbm_b_f1mae_daily_hourly,predict_lgbm_s_f1mae_daily_hourly)
-rownames(predict_sb_daily_hourly) <- c(buildings, solars)
-write.csv(predict_sb_daily_hourly, "i3-Nov.csv")
-
-```
-
-
-### Variable importance Solars
-```{r}
-# Feature importance
-lgbm_ImpVar_s0 <- lightgbm::lgb.importance(lgbm_mod_s0, percentage = TRUE)
-lgbm_ImpVar_s1 <- lightgbm::lgb.importance(lgbm_mod_s1, percentage = TRUE)
-lgbm_ImpVar_s2 <- lightgbm::lgb.importance(lgbm_mod_s2, percentage = TRUE)
-lgbm_ImpVar_s3 <- lightgbm::lgb.importance(lgbm_mod_s3, percentage = TRUE)
-lgbm_ImpVar_s4 <- lightgbm::lgb.importance(lgbm_mod_s4, percentage = TRUE)
-lgbm_ImpVar_s5 <- lightgbm::lgb.importance(lgbm_mod_s5, percentage = TRUE)
-
-# View feature importance rank
-lgbm_ImpVar_s0 %>%
-  as_tibble() %>%
-  ggplot(aes(x = fct_reorder(Feature, Gain), y = Gain)) +
-  geom_col(alpha = 0.8) +
-  labs(title = "Feature importances ranking",
-       x = "Features") +
-  coord_flip() +
-  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
-  panel.border = element_blank(),
-  axis.line = element_line())
-```
-
